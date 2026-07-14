@@ -1,0 +1,30 @@
+{
+  "arch": "resnet18",
+  "tuned_threshold": 0.0198989898989899,
+  "test_default": {
+    "accuracy": 0.9972027972027973,
+    "precision_defect": 1.0,
+    "recall_defect": 0.9955849889624724,
+    "specificity_ok": 1.0,
+    "f1_defect": 0.997787610619469,
+    "roc_auc": 1.0,
+    "tn": 262,
+    "fp": 0,
+    "fn": 2,
+    "tp": 451,
+    "threshold": 0.5
+  },
+  "test_tuned": {
+    "accuracy": 0.9804195804195804,
+    "precision_defect": 0.9700214132762313,
+    "recall_defect": 1.0,
+    "specificity_ok": 0.9465648854961832,
+    "f1_defect": 0.9847826086956522,
+    "roc_auc": 1.0,
+    "tn": 248,
+    "fp": 14,
+    "fn": 0,
+    "tp": 453,
+    "threshold": 0.0198989898989899
+  }
+}

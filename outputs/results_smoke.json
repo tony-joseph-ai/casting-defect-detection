@@ -1,0 +1,34 @@
+{
+  "arch": "simple_cnn",
+  "best_epoch": 1,
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.372647453248818,
+      "accuracy": 0.5668341708542713,
+      "precision_defect": 0.5668341708542713,
+      "recall_defect": 1.0,
+      "specificity_ok": 0.0,
+      "f1_defect": 0.7235407312379731,
+      "roc_auc": 0.7964757038719126,
+      "tn": 0,
+      "fp": 431,
+      "fn": 0,
+      "tp": 564,
+      "threshold": 0.5
+    }
+  ],
+  "test": {
+    "accuracy": 0.6335664335664336,
+    "precision_defect": 0.6335664335664336,
+    "recall_defect": 1.0,
+    "specificity_ok": 0.0,
+    "f1_defect": 0.7756849315068494,
+    "roc_auc": 0.777977183492577,
+    "tn": 0,
+    "fp": 262,
+    "fn": 0,
+    "tp": 453,
+    "threshold": 0.5
+  }
+}

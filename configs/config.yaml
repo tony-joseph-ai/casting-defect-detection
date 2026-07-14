@@ -1,0 +1,26 @@
+data:
+  root: data/casting_data
+  image_size: 224
+  val_split: 0.15
+  batch_size: 32
+  num_workers: 2
+  seed: 42
+model:
+  arch: resnet18
+  pretrained: true
+  freeze_backbone: false
+  dropout: 0.2
+train:
+  epochs: 25
+  lr: 0.001
+  weight_decay: 0.0001
+  use_class_weights: true
+  early_stopping_patience: 6
+  monitor: f1_defect
+eval:
+  threshold: 0.5
+  cost_false_negative: 10.0
+  cost_false_positive: 1.0
+paths:
+  output_dir: outputs
+  checkpoint: outputs/best_model.pt
