@@ -74,7 +74,7 @@ def plot_sweep(ths, costs, best, cost_fn, cost_fp, path: Path) -> None:
     plt.close(fig)
 
 
-def gradcam_grid(model, arch, dataset, indices, device, path: Path, title: str) -> None:
+def gradcam_grid(model, arch, dataset, indices, device, path: Path, title: str, threshold: float = 0.5) -> None:
     if not indices:
         print(f"  (no samples for {title} — skipping)")
         return
@@ -89,7 +89,8 @@ def gradcam_grid(model, arch, dataset, indices, device, path: Path, title: str) 
         axes[0, col].imshow(img)
         axes[0, col].set_title(f"true: {CLASS_NAMES[y]}", fontsize=8)
         axes[1, col].imshow(overlay_heatmap(img, cam))
-        axes[1, col].set_title(f"pred: {CLASS_NAMES[pred]}  p={p:.2f}", fontsize=8)
+        pred_at_th = int(p >= threshold)
+        axes[1, col].set_title(f"pred: {CLASS_NAMES[pred_at_th]}  p={p:.2f}", fontsize=8)
         for r in (0, 1):
             axes[r, col].axis("off")
     cam_engine.remove()
@@ -147,12 +148,14 @@ def main() -> None:
     correct_defects = [i for i in range(len(test_y)) if test_y[i] == 1 and pred_tuned[i] == 1]
     errors = [i for i in range(len(test_y)) if test_y[i] != pred_tuned[i]]
 
-    gradcam_grid(model, arch, test_ds, correct_defects, device,
+   gradcam_grid(model, arch, test_ds, correct_defects, device,
                  out / f"gradcam_correct_{tag}.png",
-                 "Grad-CAM — correctly detected defects (is it looking at the casting?)")
+                 "Grad-CAM — correctly detected defects (is it looking at the casting?)",
+                 threshold=best_th)
     gradcam_grid(model, arch, test_ds, errors, device,
                  out / f"gradcam_errors_{tag}.png",
-                 "Grad-CAM — misclassifications (where does the evidence come from?)")
+                 "Grad-CAM — misclassifications (where does the evidence come from?)",
+                 threshold=best_th)
 
     with open(out / f"report_{tag}.json", "w") as f:
         json.dump({"arch": arch, "tuned_threshold": best_th,
