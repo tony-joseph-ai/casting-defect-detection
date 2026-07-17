@@ -1,0 +1,252 @@
+# Serving-only dependencies for the FastAPI app.
+# torch / torchvision are large; on a CPU-only laptop the default wheels work
+# fine for single-image inference (no GPU needed).
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+numpy
+matplotlib
+torch
+torchvision
+
+"""Smoke tests for the serving path — NO trained checkpoint required.
+
+These build a randomly-initialised model (pretrained=False, so nothing is
+downloaded) and test the PLUMBING: preprocessing shape, prediction schema, and
+Grad-CAM output range. They deliberately do NOT test accuracy — a random model
+can't be accurate — only that the serving code is wired correctly.
+
+Run:  pytest tests/test_serve.py -q     (from the repo root)
+"""
+import numpy as np
+from PIL import Image
+
+from serve.inference import CastingPredictor
+from src.model import build_model
+
+CFG = {
+    "model": {
+        "arch": "resnet18",
+        "pretrained": False,      # no weight download in CI / offline
+        "freeze_backbone": False,
+        "dropout": 0.2,
+    },
+    "data": {"image_size": 224},
+}
+
+
+def _predictor(threshold: float = 0.5) -> CastingPredictor:
+    model = build_model(CFG)
+    return CastingPredictor(
+        model, arch="resnet18",
+        image_size=CFG["data"]["image_size"], threshold=threshold,
+    )
+
+
+def _dummy_image(w: int = 200, h: int = 180) -> Image.Image:
+    # odd, non-square size on purpose: proves the resize path actually runs.
+    arr = (np.random.rand(h, w, 3) * 255).astype("uint8")
+    return Image.fromarray(arr)
+
+
+def test_predict_schema():
+    out = _predictor().predict(_dummy_image())
+    assert set(out) >= {"prediction", "p_defect", "is_defect", "threshold"}
+    assert 0.0 <= out["p_defect"] <= 1.0
+    assert out["prediction"] in ("ok", "defect")
+    assert isinstance(out["is_defect"], bool)
+
+
+def test_explain_overlay_shape_and_range():
+    result, overlay = _predictor().explain(_dummy_image())
+    assert overlay.shape == (224, 224, 3)          # upsampled to input size
+    assert overlay.min() >= 0.0 and overlay.max() <= 1.0
+    assert 0.0 <= result["p_defect"] <= 1.0
+
+
+def test_threshold_controls_decision():
+    img = _dummy_image()
+    # threshold 0.0 -> everything is a defect; 1.0 -> nothing is (p never hits 1)
+    assert _predictor(threshold=0.0).predict(img)["is_defect"] is True
+    assert _predictor(threshold=1.0).predict(img)["is_defect"] is False
+
+
+"""Single-image inference for the casting-defect model.
+
+This module is the ONE place that turns an uploaded image into a prediction.
+Both the FastAPI service (serve/main.py) and any UI import from here, so the
+serving path can never drift from how the model was trained: it reuses the
+exact validation transform from src.data, the exact model from src.model, and
+the exact Grad-CAM from src.gradcam.
+
+Design notes worth defending in an interview:
+  * Preprocessing is imported, not re-implemented. A serving pipeline that
+    resizes or normalises even slightly differently from training gives quietly
+    worse predictions with no error. Reusing build_transforms(train=False)
+    removes that whole class of bug.
+  * The operating threshold lives in exactly one place (DEFECT_THRESHOLD).
+    0.5 is only an assumption; this project's threshold analysis (README
+    Finding 3, src/threshold.py) selects a plateau operating point. Set the env
+    var CASTING_THRESHOLD to your tuned value so the demo matches your report.
+  * explain() runs WITHOUT torch.no_grad(): Grad-CAM needs a backward pass, so
+    wrapping it in no_grad would crash. predict() keeps no_grad for speed.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import torch
+from PIL import Image
+
+from src.data import CLASS_NAMES, build_transforms
+from src.gradcam import GradCAM, denormalize, overlay_heatmap
+from src.model import build_model, get_target_layer
+
+# P(defect) >= threshold  ->  flag as defect.
+# Override in deployment:  export CASTING_THRESHOLD=0.228   (your tuned value).
+DEFECT_THRESHOLD = float(os.environ.get("CASTING_THRESHOLD", "0.5"))
+
+
+class CastingPredictor:
+    """Wraps a trained model for single-image, production-style inference."""
+
+    def __init__(self, model, arch: str, image_size: int,
+                 threshold: float = DEFECT_THRESHOLD, device=None) -> None:
+        self.device = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self.model = model.to(self.device).eval()
+        self.arch = arch
+        self.threshold = threshold
+        # The clean (non-augmented) transform used for val/test — same one here.
+        self.transform = build_transforms(image_size, train=False)
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path, threshold: float = DEFECT_THRESHOLD,
+                        device=None) -> "CastingPredictor":
+        """Load a predictor from a training checkpoint.
+
+        The checkpoint carries its own config and arch (see src/evaluate.py),
+        so we rebuild the exact network it was trained as.
+        """
+        device = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        path = Path(checkpoint_path)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Checkpoint not found: {path}\n"
+                "Point CASTING_CHECKPOINT at your trained .pt file, or place it "
+                "at the default path."
+            )
+        ckpt = torch.load(path, map_location=device)
+        cfg, arch = ckpt["config"], ckpt["arch"]
+        model = build_model(cfg)
+        model.load_state_dict(ckpt["state_dict"])
+        image_size = cfg["data"]["image_size"]
+        return cls(model, arch, image_size, threshold=threshold, device=device)
+
+    def _to_tensor(self, image: Image.Image) -> torch.Tensor:
+        # convert('RGB') first so PNGs with alpha or single-channel inputs are
+        # normalised before the grayscale-then-3-channel transform runs.
+        return self.transform(image.convert("RGB")).unsqueeze(0).to(self.device)
+
+    @torch.no_grad()
+    def predict(self, image: Image.Image) -> dict:
+        x = self._to_tensor(image)
+        p_defect = float(torch.softmax(self.model(x), dim=1)[0, 1].item())
+        return self._result(p_defect)
+
+    def explain(self, image: Image.Image):
+        """Return (result_dict, overlay) where overlay is HxWx3 float in [0,1].
+
+        NOTE: intentionally NOT decorated with @torch.no_grad — Grad-CAM's
+        backward pass needs the graph. The panel label is derived from the SAME
+        threshold used everywhere else, avoiding the argmax-vs-threshold
+        mismatch that the evaluate.py fix addressed.
+        """
+        x = self._to_tensor(image)
+        cam_engine = GradCAM(self.model, get_target_layer(self.model, self.arch))
+        try:
+            cam, _pred, p_defect = cam_engine(x)
+        finally:
+            cam_engine.remove()  # always detach hooks, even on error
+        overlay = overlay_heatmap(denormalize(x[0]), cam)
+        return self._result(p_defect), overlay
+
+    def _result(self, p_defect: float) -> dict:
+        is_defect = p_defect >= self.threshold
+        return {
+            "prediction": CLASS_NAMES[1] if is_defect else CLASS_NAMES[0],
+            "p_defect": round(p_defect, 6),
+            "is_defect": bool(is_defect),
+            "threshold": self.threshold,
+        }
+
+"""FastAPI service for casting-defect inspection.
+
+Endpoints:
+    GET  /health          -> {"status": "ok"}   (liveness; no model needed)
+    POST /predict         -> {"prediction", "p_defect", "is_defect", "threshold"}
+    POST /predict/overlay -> image/png           (Grad-CAM heatmap on the part)
+
+Run locally:
+    export CASTING_CHECKPOINT=outputs/best_resnet18.pt
+    export CASTING_THRESHOLD=0.228          # your tuned operating point
+    uvicorn serve.main:app --reload
+Then open http://127.0.0.1:8000/docs and try it in the browser.
+
+The model is loaded lazily on the first prediction request, so the process
+starts (and /health answers) even before the checkpoint is present.
+"""
+from __future__ import annotations
+
+import io
+import os
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
+from PIL import Image
+
+from serve.inference import CastingPredictor
+
+CHECKPOINT = os.environ.get("CASTING_CHECKPOINT", "outputs/best_resnet18.pt")
+
+app = FastAPI(title="Casting Defect Inspection", version="0.1.0")
+
+_predictor: CastingPredictor | None = None
+
+
+def get_predictor() -> CastingPredictor:
+    global _predictor
+    if _predictor is None:
+        _predictor = CastingPredictor.from_checkpoint(CHECKPOINT)
+    return _predictor
+
+
+def _read_image(file: UploadFile) -> Image.Image:
+    try:
+        return Image.open(io.BytesIO(file.file.read()))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read image file.")
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok"}
+
+
+@app.post("/predict")
+def predict(file: UploadFile = File(...)) -> dict:
+    return get_predictor().predict(_read_image(file))
+
+
+@app.post("/predict/overlay")
+def predict_overlay(file: UploadFile = File(...)) -> StreamingResponse:
+    _result, overlay = get_predictor().explain(_read_image(file))
+    buf = io.BytesIO()
+    Image.fromarray((overlay * 255).astype("uint8")).save(buf, format="PNG")
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png")
